@@ -569,8 +569,7 @@ class Parser(object):
             state = torch.load(path, map_location='cpu', weights_only=False, **kwargs)
         else:
             state = torch.load(path, map_location='cpu', **kwargs)
-
-        state = torch.load(path, map_location='cpu', **kwargs)
+        
         cls = supar.PARSER[state['name']] if cls.NAME is None else cls
         args = state['args'].update(args)
         model = cls.MODEL(**args)
