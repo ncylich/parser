@@ -9,6 +9,7 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+import inspect
 from typing import Any, Iterable, Union
 
 import dill
@@ -562,7 +563,6 @@ class Parser(object):
         args = Config(**locals())
         if not os.path.exists(path):
             path = download(supar.MODEL[src].get(path, path), reload=reload)
-                import inspect
         
         load_sig = inspect.signature(torch.load)
         if "weights_only" in load_sig.parameters:
