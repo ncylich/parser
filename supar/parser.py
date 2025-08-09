@@ -562,6 +562,14 @@ class Parser(object):
         args = Config(**locals())
         if not os.path.exists(path):
             path = download(supar.MODEL[src].get(path, path), reload=reload)
+                import inspect
+        
+        load_sig = inspect.signature(torch.load)
+        if "weights_only" in load_sig.parameters:
+            state = torch.load(path, map_location='cpu', weights_only=False, **kwargs)
+        else:
+            state = torch.load(path, map_location='cpu', **kwargs)
+
         state = torch.load(path, map_location='cpu', **kwargs)
         cls = supar.PARSER[state['name']] if cls.NAME is None else cls
         args = state['args'].update(args)
