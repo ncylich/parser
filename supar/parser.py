@@ -607,7 +607,7 @@ class Parser(object):
         
         # Ensure we don't pass unexpected kwargs into torch.load that may break older PyTorch
         # Load with dill to support legacy pickles saved using dill
-        state = torch.load(path, map_location='cpu', pickle_module=dill)
+        state = torch.load(path, map_location='cpu', pickle_module=dill, weights_only=False)
         
         cls = supar.PARSER[state['name']] if cls.NAME is None else cls
         args = state['args'].update(args)
