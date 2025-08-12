@@ -10,7 +10,7 @@ import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 import inspect
-from typing import Any, Iterable, Union
+from typing import Any, Iterable, Union, Optional
 
 import dill
 import torch
@@ -53,7 +53,39 @@ class Parser(object):
 
     @property
     def device(self):
-        return 'cuda' if torch.cuda.is_available() else 'cpu'
+        # Prefer an explicitly set device if present
+        if hasattr(self, '_device') and self._device is not None:
+            return self._device
+        if torch.cuda.is_available():
+            return 'cuda'
+        # MPS support (Apple Silicon)
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            return 'mps'
+        return 'cpu'
+
+    def _resolve_device(self, device: Union[str, torch.device, None]) -> str:
+        if device is None:
+            return self.device
+        if isinstance(device, torch.device):
+            device = device.type
+        device = str(device)
+        # Validate availability and possibly fallback
+        if device.startswith('cuda') and not torch.cuda.is_available():
+            logger.warning("Requested CUDA device but CUDA is not available; falling back to CPU")
+            return 'cpu'
+        if device == 'mps' and not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+            logger.warning("Requested MPS device but MPS is not available; falling back to CPU")
+            return 'cpu'
+        return device
+
+    @property
+    def _amp_device_type(self) -> str:
+        # autocast supports 'cuda' and 'cpu'; MPS should use CPU autocast disabled
+        return 'cuda' if self.device.startswith('cuda') else 'cpu'
+
+    def _amp_enabled(self, enabled_flag: bool) -> bool:
+        # Only enable autocast on CUDA; CPU autocast exists but is less beneficial here
+        return bool(enabled_flag and self.device.startswith('cuda'))
 
     @property
     def sync_grad(self):
@@ -223,7 +255,7 @@ class Parser(object):
                 self.step = 1
                 for batch in bar:
                     with self.sync():
-                        with torch.autocast(self.device, enabled=args.amp):
+                        with torch.autocast(self._amp_device_type, enabled=self._amp_enabled(args.amp)):
                             loss = self.train_step(batch)
                         self.backward(loss)
                     if self.sync_grad:
@@ -239,7 +271,7 @@ class Parser(object):
                     self.step += 1
                 logger.info(f"{bar.postfix}")
             self.model.eval()
-            with self.join(), torch.autocast(self.device, enabled=args.amp):
+            with self.join(), torch.autocast(self._amp_device_type, enabled=self._amp_enabled(args.amp)):
                 metric = self.reduce(sum([self.eval_step(i) for i in progress_bar(dev.loader)], Metric()))
                 logger.info(f"{'dev:':5} {metric}")
                 if args.wandb and is_master():
@@ -361,6 +393,8 @@ class Parser(object):
         workers: int = 0,
         cache: bool = False,
         verbose: bool = True,
+        device: Union[str, torch.device, None] = None,
+        amp: bool = False,
         **kwargs
     ):
         r"""
@@ -397,6 +431,10 @@ class Parser(object):
         args = self.args.update(locals())
         init_logger(logger, verbose=args.verbose)
 
+        # Optionally move to requested device once
+        if device is not None:
+            self.to(device)
+
         self.transform.eval()
         if args.prob:
             self.transform.append(Field('probs'))
@@ -422,7 +460,9 @@ class Parser(object):
             # we have clustered the sentences by length here to speed up prediction,
             # so the order of the yielded sentences can't be guaranteed
             for batch in progress_bar(data.loader):
-                batch = self.pred_step(batch)
+                # enable autocast on CUDA only if requested
+                with torch.autocast(self._amp_device_type, enabled=self._amp_enabled(amp)):
+                    batch = self.pred_step(batch)
                 if is_dist() or args.cache:
                     for s in batch.sentences:
                         with open(os.path.join(t, f"{s.index}"), 'w') as f:
@@ -534,6 +574,7 @@ class Parser(object):
         reload: bool = False,
         src: str = 'github',
         checkpoint: bool = False,
+        device: Union[str, torch.device, None] = None,
         **kwargs
     ) -> Parser:
         r"""
@@ -564,22 +605,100 @@ class Parser(object):
         if not os.path.exists(path):
             path = download(supar.MODEL[src].get(path, path), reload=reload)
         
-        load_sig = inspect.signature(torch.load)
-        if "weights_only" in load_sig.parameters:
-            state = torch.load(path, map_location='cpu', weights_only=False, **kwargs)
-        else:
-            state = torch.load(path, map_location='cpu', **kwargs)
+        # Ensure we don't pass unexpected kwargs into torch.load that may break older PyTorch
+        # Load with dill to support legacy pickles saved using dill
+        state = torch.load(path, map_location='cpu', pickle_module=dill)
         
         cls = supar.PARSER[state['name']] if cls.NAME is None else cls
         args = state['args'].update(args)
         model = cls.MODEL(**args)
-        model.load_pretrained(state['pretrained'])
-        model.load_state_dict(state['state_dict'], False)
         transform = state['transform']
         parser = cls(args, model, transform)
+        # Resolve and set target device early
+        target_device = parser._resolve_device(device)
+        parser._device = target_device
+        # Move base modules to the target device before loading weights to allocate storages on device
+        parser.model.to(target_device)
+        # Attach pretrained embedding structures, then ensure they are on the target device
+        parser.model.load_pretrained(state['pretrained'])
+        # Ensure any newly created modules (e.g., pretrained embedding, embed_proj) are moved and cast
+        cast_dtype = torch.float32 if target_device == 'mps' else None
+        parser._move_modules_to_device_and_dtype(parser.model, target_device, cast_dtype)
+        # Now load the model weights (always loaded from CPU state)
+        parser.model.load_state_dict(state['state_dict'], strict=False)
+        # For MPS, rebuild embeddings to guarantee correct allocation
+        if target_device == 'mps':
+            parser._rebuild_embeddings(parser.model, target_device, torch.float32)
         parser.checkpoint_state_dict = state.get('checkpoint_state_dict', None) if checkpoint else None
-        parser.model.to(parser.device)
+        parser.model.eval()
         return parser
+
+    def _iter_named_modules(self, root: nn.Module):
+        for name, module in root.named_modules():
+            yield name, module
+
+    def _get_parent_and_attr(self, root: nn.Module, qualified_name: str):
+        if qualified_name == '':
+            return None, None
+        parts = qualified_name.split('.')
+        parent = root
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        return parent, parts[-1]
+
+    def _rebuild_embeddings(self, root: nn.Module, device: str, dtype: Optional[torch.dtype]):
+        for name, module in list(root.named_modules()):
+            if isinstance(module, nn.Embedding):
+                parent, attr = self._get_parent_and_attr(root, name)
+                if parent is None:
+                    continue
+                old_weight = module.weight.detach()
+                target_dtype = dtype if dtype is not None else old_weight.dtype
+                new_emb = nn.Embedding(
+                    num_embeddings=module.num_embeddings,
+                    embedding_dim=module.embedding_dim,
+                    padding_idx=module.padding_idx,
+                    max_norm=module.max_norm,
+                    norm_type=module.norm_type,
+                    scale_grad_by_freq=module.scale_grad_by_freq,
+                    sparse=module.sparse,
+                    device=device,
+                    dtype=target_dtype,
+                )
+                with torch.no_grad():
+                    new_emb.weight.copy_(old_weight.to(device=device, dtype=target_dtype).contiguous())
+                setattr(parent, attr, new_emb)
+
+    def _move_modules_to_device_and_dtype(self, root: nn.Module, device: str, dtype: Optional[torch.dtype]):
+        # Move entire module, and if dtype is specified, cast floating-point parameters/buffers
+        if dtype is not None:
+            root.to(device=device, dtype=dtype)
+        else:
+            root.to(device=device)
+
+    def to(self, device: Union[str, torch.device, None] = None, dtype: Optional[torch.dtype] = None, warmup: bool = False):
+        target_device = self._resolve_device(device)
+        self._device = target_device
+        # Enforce float32 on MPS by default unless a dtype is explicitly provided
+        target_dtype = dtype if dtype is not None else (torch.float32 if target_device == 'mps' else None)
+        self._move_modules_to_device_and_dtype(self.model, target_device, target_dtype)
+        # Rebuild embeddings to ensure device-native allocations (especially for MPS)
+        if target_device == 'mps':
+            self._rebuild_embeddings(self.model, target_device, torch.float32)
+        # Move any tensor attributes attached directly on the parser (rare but e.g., left_mask)
+        for attr_name in dir(self):
+            if attr_name.startswith('_'):
+                continue
+            try:
+                val = getattr(self, attr_name)
+            except Exception:
+                continue
+            if torch.is_tensor(val):
+                setattr(self, attr_name, val.to(target_device))
+        # Optional: pre-warm allocations by calling a no-op; actual forward warmup requires task-specific inputs
+        if warmup:
+            self.model.eval()
+        return self
 
     def save(self, path: str) -> None:
         model = self.model

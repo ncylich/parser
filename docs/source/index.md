@@ -13,6 +13,8 @@ and highly-parallelized implementations of several well-known structured predict
 :maxdepth: 2
 :caption: Content
 
+api
+usage
 models/index
 structs/index
 modules/index

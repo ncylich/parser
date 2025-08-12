@@ -15,9 +15,16 @@ from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
+import urllib.request as urllib_request
 from omegaconf import DictConfig, OmegaConf
 
 from supar.utils.common import CACHE
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - tqdm optional
+    def tqdm(iterable=None, total=None, unit=None, unit_scale=None, unit_divisor=None, desc=None):
+        # Minimal fallback that just iterates
+        return iterable
 from supar.utils.parallel import wait
 
 
@@ -309,14 +316,25 @@ def pad(
     total_length: int = None,
     padding_side: str = 'right'
 ) -> torch.Tensor:
-    size = [len(tensors)] + [max(tensor.size(i) for tensor in tensors)
-                             for i in range(len(tensors[0].size()))]
+    # Determine the padded output size: [batch, dim1_max, dim2_max, ...]
+    size = [len(tensors)] + [max(tensor.size(dim_idx) for tensor in tensors)
+                             for dim_idx in range(len(tensors[0].size()))]
     if total_length is not None:
         assert total_length >= size[1]
         size[1] = total_length
-    out_tensor = tensors[0].data.new(*size).fill_(padding_value)
-    for i, tensor in enumerate(tensors):
-        out_tensor[i][[slice(-i, None) if padding_side == 'left' else slice(0, i) for i in tensor.size()]] = tensor
+    out_tensor = tensors[0].new_full(size, padding_value)
+
+    for batch_index, tensor in enumerate(tensors):
+        # Build slice objects for each non-batch dimension
+        per_dim_slices = []
+        for dim_length in tensor.size():
+            if padding_side == 'left':
+                per_dim_slices.append(slice(-dim_length, None))
+            else:
+                per_dim_slices.append(slice(0, dim_length))
+        # Convert to tuple for proper multi-dim slicing
+        per_dim_slices = tuple(per_dim_slices)
+        out_tensor[(batch_index, *per_dim_slices)] = tensor
     return out_tensor
 
 
@@ -330,11 +348,28 @@ def download(url: str, path: Optional[str] = None, reload: bool = False, clean: 
     if reload and os.path.exists(path):
         os.remove(path)
     if not os.path.exists(path):
-        sys.stderr.write(f"Downloading {url} to {path}\n")
+        sys.stdout.write(f"Downloading {url}\n")
+        sys.stdout.flush()
         try:
-            torch.hub.download_url_to_file(url, path, progress=True)
+            # Stream download with progress bar
+            req = urllib_request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib_request.urlopen(req) as resp, open(path, 'wb') as f:
+                total = int(resp.headers.get('Content-Length', 0))
+                chunk_size = 1024 * 1024
+                with tqdm(total=total, unit='B', unit_scale=True, unit_divisor=1024,
+                          desc=f"{filename}") as bar:
+                    while True:
+                        chunk = resp.read(chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        bar.update(len(chunk))
         except (ValueError, urllib.error.URLError):
-            raise RuntimeError(f"File {url} unavailable. Please try other sources.")
+            # fallback to torch.hub helper
+            try:
+                torch.hub.download_url_to_file(url, path, progress=True)
+            except Exception as e:
+                raise RuntimeError(f"File {url} unavailable. Please try other sources.\n{e}")
     return extract(path, reload, clean)
 
 

@@ -169,7 +169,9 @@ class Model(nn.Module):
 
     def encode(self, words, feats=None):
         if self.args.encoder == 'lstm':
-            x = pack_padded_sequence(self.embed(words, feats), words.ne(self.args.pad_index).sum(1).tolist(), True, False)
+            lengths = words.ne(self.args.pad_index).sum(1)
+            # Guard against zero-length sequences in prediction by clamping to at least 1 token
+            x = pack_padded_sequence(self.embed(words, feats), lengths.clamp_min(1).tolist(), True, False)
             x, _ = self.encoder(x)
             x, _ = pad_packed_sequence(x, True, total_length=words.shape[1])
         elif self.args.encoder == 'transformer':

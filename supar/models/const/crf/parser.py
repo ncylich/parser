@@ -99,8 +99,9 @@ class CRFConstituencyParser(Parser):
     @torch.no_grad()
     def eval_step(self, batch: Batch) -> SpanMetric:
         words, *feats, trees, charts = batch
-        mask = batch.mask[:, 1:]
-        mask = (mask.unsqueeze(1) & mask.unsqueeze(2)).triu_(1)
+        token_mask = words.ne(self.args.pad_index) if len(words.shape) < 3 else words.ne(self.args.pad_index).any(-1)
+        inner = token_mask[:, 1:]
+        mask = (inner.unsqueeze(1) & inner.unsqueeze(2)).triu_(1)
         s_span, s_label = self.model(words, feats)
         loss, s_span = self.model.loss(s_span, s_label, charts, mask, self.args.mbr)
         chart_preds = self.model.decode(s_span, s_label, mask)
@@ -113,14 +114,16 @@ class CRFConstituencyParser(Parser):
     @torch.no_grad()
     def pred_step(self, batch: Batch) -> Batch:
         words, *feats, trees = batch
-        mask, lens = batch.mask[:, 1:], batch.lens - 2
-        mask = (mask.unsqueeze(1) & mask.unsqueeze(2)).triu_(1)
+        token_mask = words.ne(self.args.pad_index) if len(words.shape) < 3 else words.ne(self.args.pad_index).any(-1)
+        inner = token_mask[:, 1:]
+        mask = (inner.unsqueeze(1) & inner.unsqueeze(2)).triu_(1)
         s_span, s_label = self.model(words, feats)
-        s_span = ConstituencyCRF(s_span, mask[:, 0].sum(-1)).marginals if self.args.mbr else s_span
+        s_span = ConstituencyCRF(s_span, inner.sum(-1)).marginals if self.args.mbr else s_span
         chart_preds = self.model.decode(s_span, s_label, mask)
         batch.trees = [Tree.build(tree, [(i, j, self.CHART.vocab[label]) for i, j, label in chart])
                        for tree, chart in zip(trees, chart_preds)]
         if self.args.prob:
+            lens = inner.sum(-1).tolist()
             batch.probs = [prob[:i-1, 1:i].cpu() for i, prob in zip(lens, s_span)]
         return batch
 

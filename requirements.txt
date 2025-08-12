@@ -1,0 +1,14 @@
+# Core dependencies for SuPar parser
+numpy>1.21.6
+torch>=1.13.1
+transformers>=4.30.0
+nltk
+stanza
+omegaconf
+dill
+pathos
+opt_einsum
+
+# Optional dependencies
+# allennlp  # for ELMO embeddings
+# subword-nmt  # for BPE tokenization

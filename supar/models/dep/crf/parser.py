@@ -98,7 +98,7 @@ class CRFDependencyParser(BiaffineDependencyParser):
     @torch.no_grad()
     def eval_step(self, batch: Batch) -> AttachmentMetric:
         words, _, *feats, arcs, rels = batch
-        mask = batch.mask
+        mask = words.ne(self.args.pad_index) if len(words.shape) < 3 else words.ne(self.args.pad_index).any(-1)
         # ignore the first token of each sentence
         mask[:, 0] = 0
         s_arc, s_rel = self.model(words, feats)
@@ -115,9 +115,10 @@ class CRFDependencyParser(BiaffineDependencyParser):
     def pred_step(self, batch: Batch) -> Batch:
         CRF = DependencyCRF if self.args.proj else MatrixTree
         words, _, *feats = batch
-        mask, lens = batch.mask, batch.lens - 1
+        mask = words.ne(self.args.pad_index) if len(words.shape) < 3 else words.ne(self.args.pad_index).any(-1)
         # ignore the first token of each sentence
         mask[:, 0] = 0
+        lens = mask.sum(-1)
         s_arc, s_rel = self.model(words, feats)
         s_arc = CRF(s_arc, lens).marginals if self.args.mbr else s_arc
         arc_preds, rel_preds = self.model.decode(s_arc, s_rel, mask, self.args.tree, self.args.proj)

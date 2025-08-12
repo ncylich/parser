@@ -104,7 +104,7 @@ class CRF2oDependencyParser(BiaffineDependencyParser):
     @torch.no_grad()
     def eval_step(self, batch: Batch) -> AttachmentMetric:
         words, _, *feats, arcs, sibs, rels = batch
-        mask = batch.mask
+        mask = words.ne(self.args.pad_index) if len(words.shape) < 3 else words.ne(self.args.pad_index).any(-1)
         # ignore the first token of each sentence
         mask[:, 0] = 0
         s_arc, s_sib, s_rel = self.model(words, feats)
@@ -120,9 +120,10 @@ class CRF2oDependencyParser(BiaffineDependencyParser):
     @torch.no_grad()
     def pred_step(self, batch: Batch) -> Batch:
         words, _, *feats = batch
-        mask, lens = batch.mask, batch.lens - 1
+        mask = words.ne(self.args.pad_index) if len(words.shape) < 3 else words.ne(self.args.pad_index).any(-1)
         # ignore the first token of each sentence
         mask[:, 0] = 0
+        lens = mask.sum(-1)
         s_arc, s_sib, s_rel = self.model(words, feats)
         s_arc, s_sib = Dependency2oCRF((s_arc, s_sib), lens).marginals if self.args.mbr else (s_arc, s_sib)
         arc_preds, rel_preds = self.model.decode(s_arc, s_sib, s_rel, mask, self.args.tree, self.args.mbr, self.args.proj)

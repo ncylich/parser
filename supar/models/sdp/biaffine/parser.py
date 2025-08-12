@@ -83,8 +83,8 @@ class BiaffineSemanticDependencyParser(Parser):
 
     def train_step(self, batch: Batch) -> torch.Tensor:
         words, *feats, labels = batch
-        mask = batch.mask
-        mask = mask.unsqueeze(1) & mask.unsqueeze(2)
+        token_mask = words.ne(self.args.pad_index) if len(words.shape) < 3 else words.ne(self.args.pad_index).any(-1)
+        mask = token_mask.unsqueeze(1) & token_mask.unsqueeze(2)
         mask[:, 0] = 0
         s_edge, s_label = self.model(words, feats)
         loss = self.model.loss(s_edge, s_label, labels, mask)
@@ -93,8 +93,8 @@ class BiaffineSemanticDependencyParser(Parser):
     @torch.no_grad()
     def eval_step(self, batch: Batch) -> ChartMetric:
         words, *feats, labels = batch
-        mask = batch.mask
-        mask = mask.unsqueeze(1) & mask.unsqueeze(2)
+        token_mask = words.ne(self.args.pad_index) if len(words.shape) < 3 else words.ne(self.args.pad_index).any(-1)
+        mask = token_mask.unsqueeze(1) & token_mask.unsqueeze(2)
         mask[:, 0] = 0
         s_edge, s_label = self.model(words, feats)
         loss = self.model.loss(s_edge, s_label, labels, mask)
@@ -104,8 +104,9 @@ class BiaffineSemanticDependencyParser(Parser):
     @torch.no_grad()
     def pred_step(self, batch: Batch) -> Batch:
         words, *feats = batch
-        mask, lens = batch.mask, (batch.lens - 1).tolist()
-        mask = mask.unsqueeze(1) & mask.unsqueeze(2)
+        token_mask = words.ne(self.args.pad_index) if len(words.shape) < 3 else words.ne(self.args.pad_index).any(-1)
+        lens = (token_mask.sum(-1) - 1).tolist()
+        mask = token_mask.unsqueeze(1) & token_mask.unsqueeze(2)
         mask[:, 0] = 0
         with torch.autocast(self.device, enabled=self.args.amp):
             s_edge, s_label = self.model(words, feats)

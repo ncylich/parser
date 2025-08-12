@@ -113,7 +113,11 @@ class Batch(object):
 
     @property
     def device(self):
-        return 'cuda' if torch.cuda.is_available() else 'cpu'
+        if torch.cuda.is_available():
+            return 'cuda'
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            return 'mps'
+        return 'cpu'
 
     @lazy_property
     def lens(self):
@@ -121,7 +125,9 @@ class Batch(object):
 
     @lazy_property
     def mask(self):
-        return self.lens.unsqueeze(-1).gt(self.lens.new_tensor(range(self.lens.max())))
+        max_len = int(self.lens.max().item())
+        rng = torch.arange(max_len, device=self.lens.device)
+        return self.lens.unsqueeze(-1).gt(rng)
 
     def compose(self, transform: Transform) -> Batch:
         for f in transform.flattened_fields:

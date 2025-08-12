@@ -81,6 +81,9 @@ class CharLSTM(nn.Module):
 
         # [n, fix_len, n_embed]
         x = self.embed(x[char_mask])
+        # If no tokens have characters, return zeros directly to avoid pack errors
+        if x.numel() == 0:
+            return x.new_zeros(*lens.shape, self.n_out)
         x = pack_padded_sequence(x, lens[char_mask].tolist(), True, False)
         x, (h, _) = self.lstm(x)
         # [n, fix_len, n_hidden]
